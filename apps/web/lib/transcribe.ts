@@ -7,6 +7,7 @@ import { createClient } from "@deepgram/sdk";
 import { eq } from "drizzle-orm";
 import { Option } from "effect";
 import { generateAiMetadata } from "@/actions/videos/generate-ai-metadata";
+import { GEMINI_MODEL, getGeminiClient } from "./gemini-client";
 import { runPromise } from "./server";
 
 type TranscribeResult = {
@@ -20,10 +21,11 @@ export async function transcribeVideo(
 	aiGenerationEnabled = false,
 	isRetry = false,
 ): Promise<TranscribeResult> {
-	if (!serverEnv().DEEPGRAM_API_KEY) {
+	if (!serverEnv().DEEPGRAM_API_KEY && !serverEnv().GEMINI_API_KEY) {
 		return {
 			success: false,
-			message: "Missing necessary environment variables",
+			message:
+				"Missing necessary environment variables (DEEPGRAM_API_KEY or GEMINI_API_KEY)",
 		};
 	}
 
@@ -284,13 +286,28 @@ function formatTimestamp(seconds: number): string {
 }
 
 async function transcribeAudio(videoUrl: string): Promise<string> {
-	//if dev - don't transcribe
 	if (serverEnv().NODE_ENV === "development") {
 		console.log("[transcribeAudio] Development mode, skipping transcription");
 		return "";
 	}
 
 	console.log("[transcribeAudio] Starting transcription for URL:", videoUrl);
+
+	if (serverEnv().DEEPGRAM_API_KEY) {
+		console.log("[transcribeAudio] Using Deepgram for transcription");
+		return transcribeWithDeepgram(videoUrl);
+	}
+
+	if (serverEnv().GEMINI_API_KEY) {
+		console.log("[transcribeAudio] Using Gemini for transcription");
+		return transcribeWithGemini(videoUrl);
+	}
+
+	console.error("[transcribeAudio] No transcription provider available");
+	return "";
+}
+
+async function transcribeWithDeepgram(videoUrl: string): Promise<string> {
 	const deepgram = createClient(serverEnv().DEEPGRAM_API_KEY as string);
 
 	const { result, error } = await deepgram.listen.prerecorded.transcribeUrl(
@@ -307,15 +324,122 @@ async function transcribeAudio(videoUrl: string): Promise<string> {
 	);
 
 	if (error) {
-		console.error("[transcribeAudio] Deepgram transcription error:", error);
+		console.error(
+			"[transcribeWithDeepgram] Deepgram transcription error:",
+			error,
+		);
 		return "";
 	}
 
 	console.log(
-		"[transcribeAudio] Transcription result received, formatting to WebVTT",
+		"[transcribeWithDeepgram] Transcription result received, formatting to WebVTT",
 	);
 	const captions = formatToWebVTT(result);
 
-	console.log("[transcribeAudio] Transcription complete, returning captions");
+	console.log(
+		"[transcribeWithDeepgram] Transcription complete, returning captions",
+	);
 	return captions;
+}
+
+async function transcribeWithGemini(videoUrl: string): Promise<string> {
+	const geminiClient = getGeminiClient();
+	if (!geminiClient) {
+		console.error("[transcribeWithGemini] Gemini client not available");
+		return "";
+	}
+
+	try {
+		console.log("[transcribeWithGemini] Fetching video data from URL");
+		const response = await fetch(videoUrl);
+		if (!response.ok) {
+			throw new Error(`Failed to fetch video: ${response.status}`);
+		}
+
+		const videoData = await response.arrayBuffer();
+		const base64Video = Buffer.from(videoData).toString("base64");
+
+		console.log(
+			"[transcribeWithGemini] Video data fetched, size:",
+			videoData.byteLength,
+		);
+
+		const model = geminiClient.getGenerativeModel({ model: GEMINI_MODEL });
+
+		const prompt = `You are a professional transcription service. Please transcribe the audio from this video file.
+
+Output ONLY a valid WebVTT subtitle file format with accurate timestamps. The format should be:
+
+WEBVTT
+
+1
+00:00:00.000 --> 00:00:03.000
+First caption text here
+
+2
+00:00:03.500 --> 00:00:06.000
+Second caption text here
+
+Rules:
+- Use HH:MM:SS.mmm format for timestamps (e.g., 00:00:05.250)
+- Each caption should be 1-2 lines max, around 5-10 words
+- Break captions at natural pauses, punctuation, or every 3-5 seconds
+- Include caption numbers before each timestamp
+- If the video has no speech/audio, return just "WEBVTT" with no captions
+- Do not include any markdown formatting, explanations, or extra text
+- Ensure timestamps are sequential and do not overlap
+- Start timestamps from the actual beginning of speech`;
+
+		const result = await model.generateContent([
+			{
+				inlineData: {
+					mimeType: "video/mp4",
+					data: base64Video,
+				},
+			},
+			{ text: prompt },
+		]);
+
+		const responseText = result.response.text();
+		console.log("[transcribeWithGemini] Received response from Gemini");
+
+		const cleanedVtt = cleanGeminiVttResponse(responseText);
+
+		if (!cleanedVtt.startsWith("WEBVTT")) {
+			console.error("[transcribeWithGemini] Invalid VTT response from Gemini");
+			return "WEBVTT\n\n";
+		}
+
+		console.log("[transcribeWithGemini] Transcription complete");
+		return cleanedVtt;
+	} catch (error) {
+		console.error(
+			"[transcribeWithGemini] Error during Gemini transcription:",
+			error,
+		);
+		return "";
+	}
+}
+
+function cleanGeminiVttResponse(response: string): string {
+	let cleaned = response.trim();
+
+	if (cleaned.startsWith("```vtt")) {
+		cleaned = cleaned.replace(/^```vtt\s*/, "").replace(/```\s*$/, "");
+	} else if (cleaned.startsWith("```webvtt")) {
+		cleaned = cleaned.replace(/^```webvtt\s*/, "").replace(/```\s*$/, "");
+	} else if (cleaned.startsWith("```")) {
+		cleaned = cleaned.replace(/^```\s*/, "").replace(/```\s*$/, "");
+	}
+
+	cleaned = cleaned.trim();
+
+	if (!cleaned.startsWith("WEBVTT")) {
+		const webvttIndex = cleaned.indexOf("WEBVTT");
+		if (webvttIndex !== -1) {
+			cleaned = cleaned.substring(webvttIndex);
+		}
+	}
+
+	return cleaned;
 }
