@@ -342,31 +342,7 @@ async function transcribeWithDeepgram(videoUrl: string): Promise<string> {
 	return captions;
 }
 
-async function transcribeWithGemini(videoUrl: string): Promise<string> {
-	const geminiClient = getGeminiClient();
-	if (!geminiClient) {
-		console.error("[transcribeWithGemini] Gemini client not available");
-		return "";
-	}
-
-	try {
-		console.log("[transcribeWithGemini] Fetching video data from URL");
-		const response = await fetch(videoUrl);
-		if (!response.ok) {
-			throw new Error(`Failed to fetch video: ${response.status}`);
-		}
-
-		const videoData = await response.arrayBuffer();
-		const base64Video = Buffer.from(videoData).toString("base64");
-
-		console.log(
-			"[transcribeWithGemini] Video data fetched, size:",
-			videoData.byteLength,
-		);
-
-		const model = geminiClient.getGenerativeModel({ model: GEMINI_MODEL });
-
-		const prompt = `You are a professional transcription service. Please transcribe the audio from this video file.
+const GEMINI_TRANSCRIPTION_PROMPT = `You are a professional transcription service. Please transcribe the audio from this video file.
 
 Output ONLY a valid WebVTT subtitle file format with accurate timestamps. The format should be:
 
@@ -390,14 +366,61 @@ Rules:
 - Ensure timestamps are sequential and do not overlap
 - Start timestamps from the actual beginning of speech`;
 
+const MAX_VIDEO_SIZE_BYTES = 100 * 1024 * 1024;
+
+async function transcribeWithGemini(videoUrl: string): Promise<string> {
+	const geminiClient = getGeminiClient();
+	if (!geminiClient) {
+		console.error("[transcribeWithGemini] Gemini client not available");
+		return "";
+	}
+
+	try {
+		console.log("[transcribeWithGemini] Fetching video data from URL");
+		const response = await fetch(videoUrl);
+		if (!response.ok) {
+			throw new Error(`Failed to fetch video: ${response.status}`);
+		}
+
+		const contentLength = response.headers.get("content-length");
+		if (contentLength && parseInt(contentLength, 10) > MAX_VIDEO_SIZE_BYTES) {
+			console.error(
+				`[transcribeWithGemini] Video too large for Gemini transcription: ${contentLength} bytes`,
+			);
+			return "";
+		}
+
+		const contentType = response.headers.get("content-type") || "video/mp4";
+		const mimeType = contentType.split(";")[0].trim();
+
+		const videoData = await response.arrayBuffer();
+
+		if (videoData.byteLength > MAX_VIDEO_SIZE_BYTES) {
+			console.error(
+				`[transcribeWithGemini] Video too large: ${videoData.byteLength} bytes exceeds ${MAX_VIDEO_SIZE_BYTES} byte limit`,
+			);
+			return "";
+		}
+
+		const base64Video = Buffer.from(videoData).toString("base64");
+
+		console.log(
+			"[transcribeWithGemini] Video data fetched, size:",
+			videoData.byteLength,
+			"mime:",
+			mimeType,
+		);
+
+		const model = geminiClient.getGenerativeModel({ model: GEMINI_MODEL });
+
 		const result = await model.generateContent([
 			{
 				inlineData: {
-					mimeType: "video/mp4",
+					mimeType: mimeType,
 					data: base64Video,
 				},
 			},
-			{ text: prompt },
+			{ text: GEMINI_TRANSCRIPTION_PROMPT },
 		]);
 
 		const responseText = result.response.text();
