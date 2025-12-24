@@ -83,6 +83,10 @@ function createServerEnv() {
 
 			/// AI providers
 			DEEPGRAM_API_KEY: z.string().optional().describe("Audio transcription"),
+			GEMINI_API_KEY: z
+				.string()
+				.optional()
+				.describe("Free audio transcription via Google Gemini"),
 			OPENAI_API_KEY: z.string().optional().describe("AI summaries"),
 			GROQ_API_KEY: z.string().optional().describe("AI summaries"),
 
